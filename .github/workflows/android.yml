@@ -1,0 +1,112 @@
+
+name: JULIET AI Android APK Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build JULIET AI Debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Verify project files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f settings.gradle.kts
+          test -f build.gradle.kts
+          test -f app/build.gradle.kts
+          test -f gradle/wrapper/gradle-wrapper.properties
+          java -version
+          gradle --version
+
+      - name: Build JULIET APK
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG_FILE="$RUNNER_TEMP/build.log"
+
+          set +e
+          gradle assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            --console=plain 2>&1 | tee "$LOG_FILE"
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            {
+              echo "## JULIET AI Build Error"
+              echo '```text'
+              tail -n 180 "$LOG_FILE"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$BUILD_STATUS"
+          fi
+
+          mkdir -p "$RUNNER_TEMP/apk-out"
+          APK_FILE="$(find app/build/outputs/apk/debug \
+            -type f -name '*.apk' -print -quit)"
+
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::APK file was not generated."
+            exit 1
+          fi
+
+          cp "$APK_FILE" \
+            "$RUNNER_TEMP/apk-out/JULIET-AI-debug.apk"
+
+      - name: Upload JULIET APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JULIET-AI-Debug-APK
+          path: ${{ runner.temp }}/apk-out/JULIET-AI-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JULIET-AI-Build-Log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+          retention-days: 14
