@@ -11,14 +11,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: juliet-android-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build JULIET AI Debug APK
+    name: Build JULIET AI APK
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -26,54 +30,135 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Inspect repository structure
+        shell: bash
+        run: |
+          echo "Repository root:"
+          pwd
+          echo ""
+          echo "Root files:"
+          ls -la
+          echo ""
+          echo "Gradle project files:"
+          find . -maxdepth 5 \
+            -type f \
+            \( -name "settings.gradle" \
+            -o -name "settings.gradle.kts" \
+            -o -name "build.gradle" \
+            -o -name "build.gradle.kts" \
+            -o -name "gradlew" \
+            -o -name "gradle-wrapper.properties" \) \
+            -not -path "./.git/*" \
+            -print
+
+      - name: Locate Android project
+        id: locate
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
+
+          PROJECT_DIR=""
+
+          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
+            PROJECT_DIR="."
+          else
+            for FILE in \
+              $(find . -maxdepth 5 -type f \
+                \( -name "settings.gradle.kts" \
+                -o -name "settings.gradle" \) \
+                -not -path "./.git/*" | sort); do
+
+                CANDIDATE="${FILE%/*}"
+                [ "$CANDIDATE" = "$FILE" ] && CANDIDATE="."
+
+                if [ -f "$CANDIDATE/app/build.gradle.kts" ] || \
+                   [ -f "$CANDIDATE/app/build.gradle" ]; then
+                  PROJECT_DIR="$CANDIDATE"
+                  break
+                fi
+            done
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::Android Gradle project not found. Ensure the extracted project files are committed to this repository."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected Android project: $PROJECT_DIR"
+
+      - name: Configure Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
-      - name: Verify project files
+      - name: Verify Java and Gradle project
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.project_dir }}
         run: |
           set -euo pipefail
-          test -f settings.gradle.kts
-          test -f build.gradle.kts
-          test -f app/build.gradle.kts
-          test -f gradle/wrapper/gradle-wrapper.properties
+
           java -version
           gradle --version
 
-      - name: Build JULIET APK
+          cd "$PROJECT_DIR"
+
+          test -f settings.gradle.kts -o -f settings.gradle
+          test -f build.gradle.kts -o -f build.gradle
+          test -f app/build.gradle.kts -o -f app/build.gradle
+
+          echo "Android project files verified."
+          echo "Project directory: $PROJECT_DIR"
+
+      - name: Build JULIET debug APK
+        id: build_apk
+        continue-on-error: true
         shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.locate.outputs.project_dir }}
         run: |
           set -uo pipefail
+
           LOG_FILE="$RUNNER_TEMP/build.log"
+          mkdir -p "$RUNNER_TEMP/apk-out"
+
+          cd "$PROJECT_DIR"
 
           set +e
           gradle assembleDebug \
             --no-daemon \
             --stacktrace \
             --console=plain 2>&1 | tee "$LOG_FILE"
+
           BUILD_STATUS=${PIPESTATUS[0]}
           set -e
 
           if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "build_status=failed" >> "$GITHUB_OUTPUT"
             {
-              echo "## JULIET AI Build Error"
+              echo "## JULIET AI Build Failed"
+              echo ""
               echo '```text'
               tail -n 180 "$LOG_FILE"
               echo '```'
@@ -81,20 +166,25 @@ jobs:
             exit "$BUILD_STATUS"
           fi
 
-          mkdir -p "$RUNNER_TEMP/apk-out"
-          APK_FILE="$(find app/build/outputs/apk/debug \
-            -type f -name '*.apk' -print -quit)"
+          APK_FILE="$(find app/build/outputs/apk \
+            -type f -name '*.apk' \
+            ! -name '*androidTest*' \
+            -print -quit)"
 
           if [ -z "$APK_FILE" ]; then
-            echo "::error::APK file was not generated."
+            echo "::error::Gradle completed, but no APK was found."
+            echo "build_status=failed" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
           cp "$APK_FILE" \
             "$RUNNER_TEMP/apk-out/JULIET-AI-debug.apk"
 
+          echo "build_status=success" >> "$GITHUB_OUTPUT"
+          echo "APK created successfully."
+
       - name: Upload JULIET APK
-        if: success()
+        if: steps.build_apk.outputs.build_status == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: JULIET-AI-Debug-APK
@@ -102,7 +192,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build log
+      - name: Upload complete build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -110,3 +200,18 @@ jobs:
           path: ${{ runner.temp }}/build.log
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Report build result
+        if: always()
+        shell: bash
+        env:
+          BUILD_STATUS: ${{ steps.build_apk.outputs.build_status }}
+        run: |
+          if [ "$BUILD_STATUS" = "success" ]; then
+            echo "## JULIET AI APK Build Successful" >> "$GITHUB_STEP_SUMMARY"
+            echo "Download JULIET-AI-Debug-APK from the workflow artifacts." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## JULIET AI APK Build Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Download JULIET-AI-Build-Log to inspect the error." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
